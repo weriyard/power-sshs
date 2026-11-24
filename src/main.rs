@@ -67,9 +67,10 @@ struct Args {
     #[arg(short, long, default_value_t = false)]
     exit: bool,
 
-    /// Open each host in its own tmux session and mark hosts that have one alive
+    /// Show live SSH connections per host and open or switch to terminal tabs
+    /// (`WezTerm`, GNOME Terminal)
     #[arg(long, default_value_t = false)]
-    tmux: bool,
+    tabs: bool,
 }
 
 fn main() -> Result<()> {
@@ -87,7 +88,7 @@ fn main() -> Result<()> {
         command_template_on_session_start: args.on_session_start_template,
         command_template_on_session_end: args.on_session_end_template,
         exit_after_ssh_session_ends: args.exit,
-        tmux_sessions: args.tmux,
+        terminal_tabs: args.tabs,
     })?;
     app.start()?;
 

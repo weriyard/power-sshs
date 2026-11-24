@@ -10,7 +10,6 @@ use ratatui::{prelude::*, widgets::*};
 use std::{
     cell::RefCell,
     cmp::{max, min},
-    collections::HashSet,
     io,
     rc::Rc,
     time::Duration,
@@ -26,11 +25,11 @@ use crate::{
     session, ssh,
 };
 
-/// How often the live tmux sessions are re-read while no key is pressed.
-const SESSION_REFRESH: Duration = Duration::from_secs(2);
+/// How often live connections are re-read while no key is pressed.
+const CONNECTION_REFRESH: Duration = Duration::from_secs(2);
 
-const INFO_TEXT_TMUX: &str =
-    "(Esc) quit | (↑/↓) move | (←/→, tab) switch tab | (enter) open session | (ctrl+r) reload";
+const INFO_TEXT_TABS: &str =
+    "(Esc) quit | (↑/↓) move | (←/→, tab) switch tab | (enter) connect or go to tab | (ctrl+r) reload";
 
 const INFO_TEXT: &str =
     "(Esc) quit | (↑/↓) move | (←/→, tab) switch tab | (enter) select | (ctrl+r) reload";
@@ -51,7 +50,7 @@ pub struct AppConfig {
     pub command_template_on_session_start: Option<String>,
     pub command_template_on_session_end: Option<String>,
     pub exit_after_ssh_session_ends: bool,
-    pub tmux_sessions: bool,
+    pub terminal_tabs: bool,
 }
 
 pub struct App {
@@ -67,14 +66,31 @@ pub struct App {
     /// Every host from the configuration, in display order.
     all_hosts: Vec<ssh::Host>,
     tab: Tab,
-    /// tmux sessions alive at the last refresh, by session name.
-    live_sessions: HashSet<String>,
+    /// The terminal emulator, for opening and switching tabs.
+    terminal: session::TerminalKind,
+    /// Interactive ssh processes at the last refresh.
+    connections: Vec<session::Connection>,
+    /// The tab chooser shown for a host that already has a connection.
+    popup: Option<Popup>,
+    /// A message shown in the footer until the next key press.
+    status: Option<String>,
     /// The hosts of the current tab, filtered by the search input.
     hosts: Searchable<ssh::Host>,
     table_columns_constraints: Vec<Constraint>,
     page_step: usize,
 
     palette: tailwind::Palette,
+}
+
+/// The tab chooser for a host that already has connections.
+struct Popup {
+    host: ssh::Host,
+    /// Number of terminals holding a connection to the host.
+    connections: usize,
+    /// Tabs found for those connections, in the order offered.
+    tabs: Vec<session::Tab>,
+    /// Why the terminal could not be asked for its tabs, if it could not.
+    error: Option<String>,
 }
 
 #[derive(PartialEq)]
@@ -111,9 +127,12 @@ impl App {
             ),
             all_hosts: hosts,
             tab: config.initial_tab,
-            live_sessions: HashSet::new(),
+            terminal: session::TerminalKind::detect(),
+            connections: Vec::new(),
+            popup: None,
+            status: None,
         };
-        app.refresh_live_sessions();
+        app.refresh_connections();
         app.calculate_table_columns_constraints();
 
         Ok(app)
@@ -149,8 +168,8 @@ impl App {
         loop {
             terminal.borrow_mut().draw(|f| ui(f, self))?;
 
-            if self.config.tmux_sessions && !event::poll(SESSION_REFRESH)? {
-                self.refresh_live_sessions();
+            if self.config.terminal_tabs && !event::poll(CONNECTION_REFRESH)? {
+                self.refresh_connections();
                 continue;
             }
 
@@ -186,6 +205,15 @@ impl App {
         use KeyCode::*;
 
         let is_ctrl_pressed = key.modifiers.contains(KeyModifiers::CONTROL);
+        self.status = None;
+
+        if self.popup.is_some() {
+            if is_ctrl_pressed && key.code == Char('c') {
+                return Ok(AppKeyAction::Stop);
+            }
+            self.on_popup_key(key.code);
+            return Ok(AppKeyAction::Ok);
+        }
 
         if is_ctrl_pressed {
             let action = self.on_key_press_ctrl(key);
@@ -227,11 +255,9 @@ impl App {
 
                 let host: &ssh::Host = &self.hosts[selected];
 
-                if self.config.tmux_sessions && session::inside_tmux() {
-                    // The client switches to the host's session; this one keeps running.
-                    let command = host.render_command_template(&self.config.command_template)?;
-                    session::open(&host.name, &command)?;
-                    self.refresh_live_sessions();
+                if self.config.terminal_tabs && self.terminal != session::TerminalKind::Other {
+                    let host = host.clone();
+                    self.connect_or_choose_tab(&host);
                     return Ok(AppKeyAction::Ok);
                 }
 
@@ -241,19 +267,14 @@ impl App {
                     host.spawn_command_template(template)?;
                 }
 
-                if self.config.tmux_sessions {
-                    let command = host.render_command_template(&self.config.command_template)?;
-                    session::open(&host.name, &command)?;
-                } else {
-                    host.spawn_command_template(&self.config.command_template)?;
-                }
+                host.spawn_command_template(&self.config.command_template)?;
 
                 if let Some(template) = &self.config.command_template_on_session_end {
                     host.spawn_command_template(template)?;
                 }
 
                 setup_terminal(terminal).expect("Failed to setup terminal");
-                self.refresh_live_sessions();
+                self.refresh_connections();
 
                 if self.config.exit_after_ssh_session_ends {
                     return Ok(AppKeyAction::Stop);
@@ -322,24 +343,99 @@ impl App {
         }
     }
 
-    fn refresh_live_sessions(&mut self) {
-        if self.config.tmux_sessions {
-            self.live_sessions = session::live_sessions();
+    fn refresh_connections(&mut self) {
+        if self.config.terminal_tabs {
+            self.connections = session::live_connections();
         }
     }
 
-    /// The host name as shown in the Name column. In tmux mode a host with a
-    /// live session gets [`session::LIVE_MARKER`] in place of its indent.
-    fn name_cell(&self, name: &str) -> String {
-        if !self.config.tmux_sessions {
-            return grouping::display_name(name);
+    /// Number of terminals holding a connection to `host`.
+    fn connection_count(&self, host: &ssh::Host) -> usize {
+        session::ttys_for(&self.connections, &host.name, &host.destination).len()
+    }
+
+    /// The host name as shown in the Name column. In tabs mode every name gets
+    /// a three-column prefix: `●N ` with the number of connections, or blanks.
+    fn name_cell(&self, host: &ssh::Host) -> String {
+        if !self.config.terminal_tabs {
+            return grouping::display_name(&host.name);
         }
-        let prefix = if self.live_sessions.contains(&session::session_name(name)) {
-            session::LIVE_MARKER
-        } else {
-            grouping::INDENT
+        let prefix = match self.connection_count(host) {
+            0 => "   ".to_string(),
+            n @ 1..=9 => format!("●{n} "),
+            _ => "●+ ".to_string(),
         };
-        format!("{prefix}{name}")
+        format!("{prefix}{}", host.name)
+    }
+
+    /// Opens a new tab for a host without a connection, or shows the tab
+    /// chooser for one that has some.
+    fn connect_or_choose_tab(&mut self, host: &ssh::Host) {
+        let ttys = session::ttys_for(&self.connections, &host.name, &host.destination);
+        if ttys.is_empty() {
+            self.open_new_tab(host);
+            return;
+        }
+
+        let (tabs, error) = match session::tabs_for(self.terminal, &ttys, &host.name) {
+            Ok(tabs) => (tabs, None),
+            Err(err) => (Vec::new(), Some(err.to_string())),
+        };
+        self.popup = Some(Popup {
+            host: host.clone(),
+            connections: ttys.len(),
+            tabs,
+            error,
+        });
+    }
+
+    fn open_new_tab(&mut self, host: &ssh::Host) {
+        let result = host
+            .render_command_template(&self.config.command_template)
+            .and_then(|command| session::open_new_tab(self.terminal, &command));
+        if let Err(err) = result {
+            self.status = Some(format!("Could not open a tab: {err}"));
+        }
+    }
+
+    fn on_popup_key(&mut self, code: KeyCode) {
+        let Some(popup) = self.popup.take() else {
+            return;
+        };
+        let jump_to = |tab: &session::Tab| session::jump(&tab.target);
+
+        let result = match code {
+            KeyCode::Esc => Ok(()),
+            KeyCode::Char('n') => {
+                self.open_new_tab(&popup.host);
+                Ok(())
+            }
+            KeyCode::Enter => {
+                if let Some(tab) = popup.tabs.first() {
+                    jump_to(tab)
+                } else {
+                    self.open_new_tab(&popup.host);
+                    Ok(())
+                }
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let index = c as usize - '1' as usize;
+                if let Some(tab) = popup.tabs.get(index) {
+                    jump_to(tab)
+                } else {
+                    self.popup = Some(popup);
+                    return;
+                }
+            }
+            _ => {
+                self.popup = Some(popup);
+                return;
+            }
+        };
+
+        if let Err(err) = result {
+            self.status = Some(format!("Could not switch to the tab: {err}"));
+        }
     }
 
     /// Switches to `tab`, keeping the search input, and selects its first host.
@@ -389,7 +485,7 @@ impl App {
         let name_len = self
             .all_hosts
             .iter()
-            .map(|d| self.name_cell(&d.name))
+            .map(|d| self.name_cell(d))
             .map(|name| UnicodeWidthStr::width(name.as_str()))
             .max()
             .unwrap_or(0);
@@ -583,6 +679,11 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     render_footer(f, app, rects[2]);
 
+    if let Some(popup) = &app.popup {
+        render_popup(f, popup, &app.palette);
+        return;
+    }
+
     let mut cursor_position = rects[0].as_position();
     cursor_position.x += u16::try_from(app.search.cursor()).unwrap_or_default() + 4;
     cursor_position.y += 1;
@@ -649,7 +750,7 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
         let row_style = host_style(&host.name);
 
         let mut content = vec![
-            app.name_cell(&host.name),
+            app.name_cell(host),
             host.aliases.clone(),
             host.user.clone().unwrap_or_default(),
             host.destination.clone(),
@@ -744,11 +845,87 @@ fn tabs_line(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
-fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
-    let text = if app.config.tmux_sessions {
-        INFO_TEXT_TMUX
+fn popup_lines(popup: &Popup) -> Vec<Line<'static>> {
+    let key = Style::new().add_modifier(Modifier::BOLD);
+    let mut lines = Vec::new();
+
+    if popup.tabs.is_empty() {
+        lines.push(Line::from("No tab found for it in this terminal."));
+        if let Some(error) = &popup.error {
+            lines.push(Line::from(error.clone()).style(Style::new().fg(tailwind::RED.c400)));
+        }
+    }
+    for (i, tab) in popup.tabs.iter().take(9).enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{}] ", i + 1), key),
+            Span::raw(tab.label.clone()),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    let enter = if popup.tabs.is_empty() {
+        "new connection"
     } else {
-        INFO_TEXT
+        "go to tab 1"
+    };
+    for (k, what) in [
+        ("[Enter] ", enter),
+        ("[n]     ", "new connection"),
+        ("[Esc]   ", "cancel"),
+    ] {
+        lines.push(Line::from(vec![Span::styled(k, key), Span::raw(what)]));
+    }
+    lines
+}
+
+fn render_popup(f: &mut Frame, popup: &Popup, palette: &tailwind::Palette) {
+    let title = format!(
+        " {}: {} connection{} ",
+        popup.host.name,
+        popup.connections,
+        if popup.connections == 1 { "" } else { "s" }
+    );
+    let lines = popup_lines(popup);
+
+    let content_width = lines
+        .iter()
+        .map(Line::width)
+        .chain(std::iter::once(UnicodeWidthStr::width(title.as_str())))
+        .max()
+        .unwrap_or(0);
+    let area = f.area();
+    let width = u16::try_from(content_width + 6)
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let height = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(palette.c400))
+                .border_type(BorderType::Rounded)
+                .padding(Padding::horizontal(2)),
+        ),
+        rect,
+    );
+}
+
+fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
+    let text = match (&app.status, app.config.terminal_tabs) {
+        (Some(status), _) => status.as_str(),
+        (None, true) => INFO_TEXT_TABS,
+        (None, false) => INFO_TEXT,
     };
     let info_footer = Paragraph::new(Line::from(text)).centered().block(
         Block::default()
@@ -778,7 +955,7 @@ mod tests {
             command_template_on_session_start: None,
             command_template_on_session_end: None,
             exit_after_ssh_session_ends: false,
-            tmux_sessions: false,
+            terminal_tabs: false,
         }
     }
 
@@ -931,38 +1108,143 @@ mod tests {
         assert!(line.contains("all (4)"), "{line}");
     }
 
-    #[test]
-    fn test_tmux_mode_marks_hosts_with_live_session() {
+    fn tabs_app() -> App {
         let mut config = test_config();
         config.config_paths = vec![crate::test_support::testdata("groups.conf")
             .to_string_lossy()
             .into_owned()];
-        config.tmux_sessions = true;
+        config.terminal_tabs = true;
         let mut app = App::new(&config).unwrap();
-        app.live_sessions = ["acme-web-b".to_string()].into_iter().collect();
+        // Never open or switch real tabs from a test, whatever terminal runs it.
+        app.terminal = session::TerminalKind::Other;
+        app
+    }
 
-        assert_eq!(app.name_cell("acme-web-b"), "● acme-web-b");
-        assert_eq!(app.name_cell("acme-web-g"), "  acme-web-g");
+    fn connection(destination: &str, tty: &str) -> session::Connection {
+        session::Connection {
+            destination: destination.to_string(),
+            tty: tty.to_string(),
+        }
+    }
 
-        let mut terminal = Terminal::new(backend::TestBackend::new(120, 20)).unwrap();
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+    fn render(app: &mut App, width: u16) -> String {
+        let mut terminal = Terminal::new(backend::TestBackend::new(width, 20)).unwrap();
+        terminal.draw(|f| ui(f, app)).unwrap();
         let buffer = terminal.backend().buffer();
-        let screen: String = (0..buffer.area.height)
-            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
-            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
-            .collect();
-
-        assert!(screen.contains("● acme-web-b"), "{screen}");
-        assert!(!screen.contains("● acme-web-g"), "{screen}");
-        assert!(screen.contains("(enter) open session"), "{screen}");
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn test_name_cell_without_tmux_mode_is_unchanged() {
+    fn test_tabs_mode_counts_connections_per_host() {
+        let mut app = tabs_app();
+        app.connections = vec![
+            connection("acme-web-b", "/dev/pts/3"),
+            // The same host by its HostName, in another terminal.
+            connection("10.0.0.2", "/dev/pts/4"),
+            // A second ssh in the same terminal is not a second tab.
+            connection("acme-web-b", "/dev/pts/3"),
+            connection("acme-web-g", "/dev/pts/5"),
+        ];
+
+        let screen = render(&mut app, 120);
+        assert!(screen.contains("●2 acme-web-b"), "{screen}");
+        assert!(screen.contains("●1 acme-web-g"), "{screen}");
+        assert!(screen.contains("   zeta-web-b"), "{screen}");
+        assert!(!screen.contains("● zeta"), "{screen}");
+        assert!(screen.contains("(enter) connect or go to tab"), "{screen}");
+    }
+
+    #[test]
+    fn test_name_cell_without_tabs_mode_is_unchanged() {
         let mut app = App::new(&test_config()).unwrap();
-        app.live_sessions = ["acme-web-b".to_string()].into_iter().collect();
-        assert_eq!(app.name_cell("acme-web-b"), "  acme-web-b");
-        assert_eq!(app.name_cell("bastion"), "bastion");
+        app.connections = vec![connection("match1", "/dev/pts/3")];
+        let host = app.all_hosts[0].clone();
+        assert_eq!(app.name_cell(&host), "match1");
+    }
+
+    #[test]
+    fn test_popup_lists_tabs_and_handles_keys() {
+        let mut app = tabs_app();
+        let host = app.all_hosts[1].clone();
+        app.popup = Some(Popup {
+            host,
+            connections: 2,
+            tabs: vec![
+                session::Tab {
+                    label: "tab 2: deploy@acme".into(),
+                    target: session::JumpTarget::WezTermPane {
+                        tab_id: 7,
+                        pane_id: 7,
+                    },
+                },
+                session::Tab {
+                    label: "tab 5: logs".into(),
+                    target: session::JumpTarget::WezTermPane {
+                        tab_id: 9,
+                        pane_id: 9,
+                    },
+                },
+            ],
+            error: None,
+        });
+
+        let screen = render(&mut app, 120);
+        assert!(screen.contains("acme-web-b: 2 connections"), "{screen}");
+        assert!(screen.contains("[1] tab 2: deploy@acme"), "{screen}");
+        assert!(screen.contains("[2] tab 5: logs"), "{screen}");
+        assert!(screen.contains("[n]"), "{screen}");
+
+        // A number without a tab and an unrelated key keep the popup open.
+        app.on_popup_key(KeyCode::Char('7'));
+        app.on_popup_key(KeyCode::Char('x'));
+        assert!(app.popup.is_some());
+
+        app.on_popup_key(KeyCode::Esc);
+        assert!(app.popup.is_none());
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn test_popup_without_tabs_offers_new_connection() {
+        let mut app = tabs_app();
+        let host = app.all_hosts[0].clone();
+        app.popup = Some(Popup {
+            host,
+            connections: 1,
+            tabs: Vec::new(),
+            error: Some("gdbus failed".into()),
+        });
+
+        let screen = render(&mut app, 120);
+        assert!(screen.contains("No tab found"), "{screen}");
+        assert!(screen.contains("gdbus failed"), "{screen}");
+        assert!(screen.contains("[Enter] new connection"), "{screen}");
+
+        // Enter opens a new tab; this terminal cannot, which is reported.
+        app.on_popup_key(KeyCode::Enter);
+        assert!(app.popup.is_none());
+        let status = app.status.clone().unwrap();
+        assert!(status.contains("cannot open tabs"), "{status}");
+    }
+
+    #[test]
+    fn test_enter_on_host_with_connection_opens_popup() {
+        let mut app = tabs_app();
+        app.connections = vec![connection("dev-web", "/dev/pts/3")];
+        let host = app.all_hosts[0].clone();
+        assert_eq!(host.name, "dev-web");
+
+        app.connect_or_choose_tab(&host);
+        let popup = app.popup.as_ref().unwrap();
+        assert_eq!(popup.connections, 1);
+        assert_eq!(popup.tabs, Vec::new());
     }
 
     /// Regression test for <https://github.com/quantumsheep/sshs/issues/120>:
