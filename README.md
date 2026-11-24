@@ -135,7 +135,7 @@ alias sshs='sshs --no-sort'
 ```bash
 git remote add upstream https://github.com/quantumsheep/sshs.git
 git fetch upstream
-git merge upstream/main
+git merge upstream/master
 ```
 
 ## Troubleshooting
