@@ -867,9 +867,9 @@ mod tests {
         assert_eq!(names(&app), vec!["acme-web-b"]);
 
         let line = tabs_line(&app).to_string();
-        assert!(line.contains("dev (1)"), "{line}");
-        assert!(line.contains("-b (2)"), "{line}");
-        assert!(line.contains("-g (1)"), "{line}");
+        assert!(line.contains("devs (1)"), "{line}");
+        assert!(line.contains("blue (2)"), "{line}");
+        assert!(line.contains("green (1)"), "{line}");
         assert!(line.contains("all (4)"), "{line}");
     }
 

@@ -35,9 +35,9 @@ impl Tab {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Tab::Dev => "dev",
-            Tab::B => "-b",
-            Tab::G => "-g",
+            Tab::Dev => "devs",
+            Tab::B => "blue",
+            Tab::G => "green",
             Tab::All => "all",
         }
     }
