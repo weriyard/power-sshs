@@ -4,6 +4,10 @@ on:
   release:
     types: [created]
 
+# Uploading binaries to the release needs write access to the repository.
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
