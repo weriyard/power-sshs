@@ -416,11 +416,7 @@ impl App {
 
         let tab = match code {
             KeyCode::Esc => return None,
-            KeyCode::Char('n') => return Some(popup.host),
-            KeyCode::Enter => match popup.tabs.first() {
-                Some(tab) => tab.clone(),
-                None => return Some(popup.host),
-            },
+            KeyCode::Enter => return Some(popup.host),
             KeyCode::Char(c @ '1'..='9') => {
                 if let Some(tab) = popup.tabs.get(c as usize - '1' as usize) {
                     tab.clone()
@@ -866,16 +862,7 @@ fn popup_lines(popup: &Popup) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::from(""));
-    let enter = if popup.tabs.is_empty() {
-        "new connection"
-    } else {
-        "go to tab 1"
-    };
-    for (k, what) in [
-        ("[Enter] ", enter),
-        ("[n]     ", "new connection"),
-        ("[Esc]   ", "cancel"),
-    ] {
+    for (k, what) in [("[Enter] ", "new connection"), ("[Esc]   ", "cancel")] {
         lines.push(Line::from(vec![Span::styled(k, key), Span::raw(what)]));
     }
     lines
@@ -1202,15 +1189,16 @@ mod tests {
         assert!(screen.contains("acme-web-b: 2 connections"), "{screen}");
         assert!(screen.contains("[1] tab 2: deploy@acme"), "{screen}");
         assert!(screen.contains("[2] tab 5: logs"), "{screen}");
-        assert!(screen.contains("[n]"), "{screen}");
+        assert!(screen.contains("[Enter] new connection"), "{screen}");
 
         // A number without a tab and an unrelated key keep the popup open.
         assert!(app.on_popup_key(KeyCode::Char('7')).is_none());
         assert!(app.on_popup_key(KeyCode::Char('x')).is_none());
         assert!(app.popup.is_some());
 
-        // [n] asks for a new connection in place, to the popup's host.
-        let host = app.on_popup_key(KeyCode::Char('n')).map(|h| h.name);
+        // Enter asks for a new connection in place, to the popup's host,
+        // even when there are tabs to go to.
+        let host = app.on_popup_key(KeyCode::Enter).map(|h| h.name);
         assert_eq!(host.as_deref(), Some("acme-web-b"));
         assert!(app.popup.is_none());
     }
@@ -1231,7 +1219,7 @@ mod tests {
         assert!(screen.contains("gdbus failed"), "{screen}");
         assert!(screen.contains("[Enter] new connection"), "{screen}");
 
-        // Without a tab, Enter asks for a new connection in place.
+        // Enter asks for a new connection in place.
         let host = app.on_popup_key(KeyCode::Enter).map(|h| h.name);
         assert_eq!(host.as_deref(), Some("dev-web"));
         assert!(app.popup.is_none());
