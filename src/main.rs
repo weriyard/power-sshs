@@ -1,5 +1,6 @@
 pub mod grouping;
 pub mod searchable;
+pub mod session;
 pub mod ssh;
 pub mod ssh_config;
 #[cfg(test)]
@@ -65,6 +66,10 @@ struct Args {
     /// Exit after ending the SSH session
     #[arg(short, long, default_value_t = false)]
     exit: bool,
+
+    /// Open each host in its own tmux session and mark hosts that have one alive
+    #[arg(long, default_value_t = false)]
+    tmux: bool,
 }
 
 fn main() -> Result<()> {
@@ -82,6 +87,7 @@ fn main() -> Result<()> {
         command_template_on_session_start: args.on_session_start_template,
         command_template_on_session_end: args.on_session_end_template,
         exit_after_ssh_session_ends: args.exit,
+        tmux_sessions: args.tmux,
     })?;
     app.start()?;
 

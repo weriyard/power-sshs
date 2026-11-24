@@ -10,8 +10,10 @@ use ratatui::{prelude::*, widgets::*};
 use std::{
     cell::RefCell,
     cmp::{max, min},
+    collections::HashSet,
     io,
     rc::Rc,
+    time::Duration,
 };
 use style::palette::tailwind;
 use tui_input::backend::crossterm::EventHandler;
@@ -21,8 +23,14 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     grouping::{self, Slot, Tab},
     searchable::Searchable,
-    ssh,
+    session, ssh,
 };
+
+/// How often the live tmux sessions are re-read while no key is pressed.
+const SESSION_REFRESH: Duration = Duration::from_secs(2);
+
+const INFO_TEXT_TMUX: &str =
+    "(Esc) quit | (↑/↓) move | (←/→, tab) switch tab | (enter) open session | (ctrl+r) reload";
 
 const INFO_TEXT: &str =
     "(Esc) quit | (↑/↓) move | (←/→, tab) switch tab | (enter) select | (ctrl+r) reload";
@@ -43,6 +51,7 @@ pub struct AppConfig {
     pub command_template_on_session_start: Option<String>,
     pub command_template_on_session_end: Option<String>,
     pub exit_after_ssh_session_ends: bool,
+    pub tmux_sessions: bool,
 }
 
 pub struct App {
@@ -58,6 +67,8 @@ pub struct App {
     /// Every host from the configuration, in display order.
     all_hosts: Vec<ssh::Host>,
     tab: Tab,
+    /// tmux sessions alive at the last refresh, by session name.
+    live_sessions: HashSet<String>,
     /// The hosts of the current tab, filtered by the search input.
     hosts: Searchable<ssh::Host>,
     table_columns_constraints: Vec<Constraint>,
@@ -100,7 +111,9 @@ impl App {
             ),
             all_hosts: hosts,
             tab: config.initial_tab,
+            live_sessions: HashSet::new(),
         };
+        app.refresh_live_sessions();
         app.calculate_table_columns_constraints();
 
         Ok(app)
@@ -135,6 +148,11 @@ impl App {
     {
         loop {
             terminal.borrow_mut().draw(|f| ui(f, self))?;
+
+            if self.config.tmux_sessions && !event::poll(SESSION_REFRESH)? {
+                self.refresh_live_sessions();
+                continue;
+            }
 
             let ev = event::read()?;
 
@@ -209,19 +227,33 @@ impl App {
 
                 let host: &ssh::Host = &self.hosts[selected];
 
+                if self.config.tmux_sessions && session::inside_tmux() {
+                    // The client switches to the host's session; this one keeps running.
+                    let command = host.render_command_template(&self.config.command_template)?;
+                    session::open(&host.name, &command)?;
+                    self.refresh_live_sessions();
+                    return Ok(AppKeyAction::Ok);
+                }
+
                 restore_terminal(terminal).expect("Failed to restore terminal");
 
                 if let Some(template) = &self.config.command_template_on_session_start {
                     host.spawn_command_template(template)?;
                 }
 
-                host.spawn_command_template(&self.config.command_template)?;
+                if self.config.tmux_sessions {
+                    let command = host.render_command_template(&self.config.command_template)?;
+                    session::open(&host.name, &command)?;
+                } else {
+                    host.spawn_command_template(&self.config.command_template)?;
+                }
 
                 if let Some(template) = &self.config.command_template_on_session_end {
                     host.spawn_command_template(template)?;
                 }
 
                 setup_terminal(terminal).expect("Failed to setup terminal");
+                self.refresh_live_sessions();
 
                 if self.config.exit_after_ssh_session_ends {
                     return Ok(AppKeyAction::Stop);
@@ -290,6 +322,26 @@ impl App {
         }
     }
 
+    fn refresh_live_sessions(&mut self) {
+        if self.config.tmux_sessions {
+            self.live_sessions = session::live_sessions();
+        }
+    }
+
+    /// The host name as shown in the Name column. In tmux mode a host with a
+    /// live session gets [`session::LIVE_MARKER`] in place of its indent.
+    fn name_cell(&self, name: &str) -> String {
+        if !self.config.tmux_sessions {
+            return grouping::display_name(name);
+        }
+        let prefix = if self.live_sessions.contains(&session::session_name(name)) {
+            session::LIVE_MARKER
+        } else {
+            grouping::INDENT
+        };
+        format!("{prefix}{name}")
+    }
+
     /// Switches to `tab`, keeping the search input, and selects its first host.
     fn show_tab(&mut self, tab: Tab) {
         self.tab = tab;
@@ -337,7 +389,7 @@ impl App {
         let name_len = self
             .all_hosts
             .iter()
-            .map(|d| grouping::display_name(&d.name))
+            .map(|d| self.name_cell(&d.name))
             .map(|name| UnicodeWidthStr::width(name.as_str()))
             .max()
             .unwrap_or(0);
@@ -597,7 +649,7 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
         let row_style = host_style(&host.name);
 
         let mut content = vec![
-            grouping::display_name(&host.name),
+            app.name_cell(&host.name),
             host.aliases.clone(),
             host.user.clone().unwrap_or_default(),
             host.destination.clone(),
@@ -693,7 +745,12 @@ fn tabs_line(app: &App) -> Line<'static> {
 }
 
 fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
-    let info_footer = Paragraph::new(Line::from(INFO_TEXT)).centered().block(
+    let text = if app.config.tmux_sessions {
+        INFO_TEXT_TMUX
+    } else {
+        INFO_TEXT
+    };
+    let info_footer = Paragraph::new(Line::from(text)).centered().block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(app.palette.c400))
@@ -721,6 +778,7 @@ mod tests {
             command_template_on_session_start: None,
             command_template_on_session_end: None,
             exit_after_ssh_session_ends: false,
+            tmux_sessions: false,
         }
     }
 
@@ -871,6 +929,40 @@ mod tests {
         assert!(line.contains("blue (2)"), "{line}");
         assert!(line.contains("green (1)"), "{line}");
         assert!(line.contains("all (4)"), "{line}");
+    }
+
+    #[test]
+    fn test_tmux_mode_marks_hosts_with_live_session() {
+        let mut config = test_config();
+        config.config_paths = vec![crate::test_support::testdata("groups.conf")
+            .to_string_lossy()
+            .into_owned()];
+        config.tmux_sessions = true;
+        let mut app = App::new(&config).unwrap();
+        app.live_sessions = ["acme-web-b".to_string()].into_iter().collect();
+
+        assert_eq!(app.name_cell("acme-web-b"), "● acme-web-b");
+        assert_eq!(app.name_cell("acme-web-g"), "  acme-web-g");
+
+        let mut terminal = Terminal::new(backend::TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+
+        assert!(screen.contains("● acme-web-b"), "{screen}");
+        assert!(!screen.contains("● acme-web-g"), "{screen}");
+        assert!(screen.contains("(enter) open session"), "{screen}");
+    }
+
+    #[test]
+    fn test_name_cell_without_tmux_mode_is_unchanged() {
+        let mut app = App::new(&test_config()).unwrap();
+        app.live_sessions = ["acme-web-b".to_string()].into_iter().collect();
+        assert_eq!(app.name_cell("acme-web-b"), "  acme-web-b");
+        assert_eq!(app.name_cell("bastion"), "bastion");
     }
 
     /// Regression test for <https://github.com/quantumsheep/sshs/issues/120>:
