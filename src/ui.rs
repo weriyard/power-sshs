@@ -18,10 +18,14 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 use unicode_width::UnicodeWidthStr;
 
-use crate::{searchable::Searchable, ssh};
+use crate::{
+    grouping::{self, Slot, Tab},
+    searchable::Searchable,
+    ssh,
+};
 
 const INFO_TEXT: &str =
-    "(Esc) quit | (↑) move up | (↓) move down | (enter) select | (ctrl+r) reload";
+    "(Esc) quit | (↑/↓) move | (←/→, tab) switch tab | (enter) select | (ctrl+r) reload";
 
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -33,6 +37,7 @@ pub struct AppConfig {
     pub sort_by_name: bool,
     pub sort_by_score: bool,
     pub show_proxy_command: bool,
+    pub initial_tab: Tab,
 
     pub command_template: String,
     pub command_template_on_session_start: Option<String>,
@@ -45,7 +50,15 @@ pub struct App {
 
     search: Input,
 
+    /// Selection as an index into the filtered host list.
     table_state: TableState,
+    /// Selection and scroll offset in the rendered table, which also holds
+    /// group header rows.
+    display_state: TableState,
+    /// Every host from the configuration, in display order.
+    all_hosts: Vec<ssh::Host>,
+    tab: Tab,
+    /// The hosts of the current tab, filtered by the search input.
     hosts: Searchable<ssh::Host>,
     table_columns_constraints: Vec<Constraint>,
     page_step: usize,
@@ -75,11 +88,18 @@ impl App {
             search: search_input.clone().into(),
 
             table_state: TableState::default().with_selected(0),
+            display_state: TableState::default(),
             table_columns_constraints: Vec::new(),
             page_step: 21,
             palette: palette_by_name(&config.color)?,
 
-            hosts: Searchable::new(config.sort_by_score, hosts, &search_input),
+            hosts: Searchable::new(
+                config.sort_by_score,
+                tab_hosts(&hosts, config.initial_tab),
+                &search_input,
+            ),
+            all_hosts: hosts,
+            tab: config.initial_tab,
         };
         app.calculate_table_columns_constraints();
 
@@ -158,6 +178,8 @@ impl App {
 
         match key.code {
             Esc => return Ok(AppKeyAction::Stop),
+            Right | KeyCode::Tab => self.show_tab(self.tab.next()),
+            Left | KeyCode::BackTab => self.show_tab(self.tab.previous()),
             Down => self.next(),
             Up => self.previous(),
             Home => self.table_state.select(Some(0)),
@@ -262,10 +284,21 @@ impl App {
     /// no longer parses.
     fn reload_hosts(&mut self) {
         if let Ok(hosts) = load_hosts(&self.config) {
-            self.hosts = Searchable::new(self.config.sort_by_score, hosts, self.search.value());
-            self.table_state.select(Some(0));
+            self.all_hosts = hosts;
+            self.show_tab(self.tab);
             self.calculate_table_columns_constraints();
         }
+    }
+
+    /// Switches to `tab`, keeping the search input, and selects its first host.
+    fn show_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.hosts = Searchable::new(
+            self.config.sort_by_score,
+            tab_hosts(&self.all_hosts, tab),
+            self.search.value(),
+        );
+        self.table_state.select(Some(0));
     }
 
     fn next(&mut self) {
@@ -302,17 +335,17 @@ impl App {
         let mut lengths = Vec::new();
 
         let name_len = self
-            .hosts
-            .non_filtered_iter()
-            .map(|d| d.name.as_str())
-            .map(UnicodeWidthStr::width)
+            .all_hosts
+            .iter()
+            .map(|d| grouping::display_name(&d.name))
+            .map(|name| UnicodeWidthStr::width(name.as_str()))
             .max()
             .unwrap_or(0);
         lengths.push(name_len);
 
         let aliases_len = self
-            .hosts
-            .non_filtered_iter()
+            .all_hosts
+            .iter()
             .map(|d| d.aliases.as_str())
             .map(UnicodeWidthStr::width)
             .max()
@@ -320,8 +353,8 @@ impl App {
         lengths.push(aliases_len);
 
         let user_len = self
-            .hosts
-            .non_filtered_iter()
+            .all_hosts
+            .iter()
             .map(|d| match &d.user {
                 Some(user) => user.as_str(),
                 None => "",
@@ -332,8 +365,8 @@ impl App {
         lengths.push(user_len);
 
         let destination_len = self
-            .hosts
-            .non_filtered_iter()
+            .all_hosts
+            .iter()
             .map(|d| d.destination.as_str())
             .map(UnicodeWidthStr::width)
             .max()
@@ -341,8 +374,8 @@ impl App {
         lengths.push(destination_len);
 
         let port_len = self
-            .hosts
-            .non_filtered_iter()
+            .all_hosts
+            .iter()
             .map(|d| match &d.port {
                 Some(port) => port.as_str(),
                 None => "",
@@ -354,8 +387,8 @@ impl App {
 
         if self.config.show_proxy_command {
             let proxy_len = self
-                .hosts
-                .non_filtered_iter()
+                .all_hosts
+                .iter()
                 .map(|d| match &d.proxy_command {
                     Some(proxy) => proxy.as_str(),
                     None => "",
@@ -379,6 +412,14 @@ impl App {
 
         self.table_columns_constraints = new_constraints;
     }
+}
+
+fn tab_hosts(hosts: &[ssh::Host], tab: Tab) -> Vec<ssh::Host> {
+    hosts
+        .iter()
+        .filter(|host| tab.contains(&host.name))
+        .cloned()
+        .collect()
 }
 
 fn load_hosts(config: &AppConfig) -> Result<Vec<ssh::Host>> {
@@ -412,7 +453,7 @@ fn load_hosts(config: &AppConfig) -> Result<Vec<ssh::Host>> {
         hosts.sort_by_key(|host| host.name.to_lowercase());
     }
 
-    Ok(hosts)
+    Ok(grouping::group_hosts(hosts))
 }
 
 fn palette_by_name(name: &str) -> Result<tailwind::Palette> {
@@ -528,9 +569,35 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
         .style(header_style)
         .height(1);
 
-    let rows = app.hosts.iter().map(|host| {
+    let group_style = Style::default()
+        .fg(app.palette.c300)
+        .add_modifier(Modifier::BOLD);
+    let column_count = header_names.len();
+
+    let selected_host = app.table_state.selected().unwrap_or(0);
+    let mut selected_row = None;
+    let mut rows = Vec::new();
+    let mut previous_group: Option<Option<String>> = None;
+
+    for (index, host) in app.hosts.iter().enumerate() {
+        let group = grouping::group_key(&host.name);
+        if previous_group.as_ref() != Some(&group) {
+            if let Some(name) = &group {
+                let mut cells = vec![Cell::from(name.to_uppercase())];
+                cells.extend((1..column_count).map(|_| Cell::from("")));
+                rows.push(Row::new(cells).style(group_style));
+            }
+            previous_group = Some(group);
+        }
+
+        if index == selected_host {
+            selected_row = Some(rows.len());
+        }
+
+        let row_style = host_style(&host.name);
+
         let mut content = vec![
-            host.name.clone(),
+            grouping::display_name(&host.name),
             host.aliases.clone(),
             host.user.clone().unwrap_or_default(),
             host.destination.clone(),
@@ -540,11 +607,16 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
             content.push(host.proxy_command.clone().unwrap_or_default());
         }
 
-        content
-            .iter()
-            .map(|content| Cell::from(Text::from(content.clone())))
-            .collect::<Row>()
-    });
+        rows.push(
+            content
+                .iter()
+                .map(|content| Cell::from(Text::from(content.clone())))
+                .collect::<Row>()
+                .style(row_style),
+        );
+    }
+
+    app.display_state.select(selected_row);
 
     let bar = " █ ";
     let t = Table::new(rows, app.table_columns_constraints.clone())
@@ -559,12 +631,65 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_spacing(HighlightSpacing::Always)
         .block(
             Block::default()
+                .title(tabs_line(app))
                 .borders(Borders::ALL)
                 .border_style(Style::new().fg(app.palette.c400))
                 .border_type(BorderType::Rounded),
         );
 
-    f.render_stateful_widget(t, area, &mut app.table_state);
+    f.render_stateful_widget(t, area, &mut app.display_state);
+}
+
+const COLOR_DEV: Color = tailwind::ORANGE.c400;
+const COLOR_B: Color = tailwind::BLUE.c400;
+const COLOR_G: Color = tailwind::GREEN.c400;
+const COLOR_ALL: Color = tailwind::YELLOW.c400;
+
+/// Row colour of a host: by slot first, then orange for the `dev` group.
+fn host_style(name: &str) -> Style {
+    match grouping::slot(name) {
+        Slot::B => Style::default().fg(COLOR_B),
+        Slot::G => Style::default().fg(COLOR_G),
+        Slot::Other if Tab::Dev.contains(name) => Style::default().fg(COLOR_DEV),
+        Slot::Other => Style::default(),
+    }
+}
+
+fn tab_color(tab: Tab) -> Color {
+    match tab {
+        Tab::Dev => COLOR_DEV,
+        Tab::B => COLOR_B,
+        Tab::G => COLOR_G,
+        Tab::All => COLOR_ALL,
+    }
+}
+
+/// The tab bar shown in the top border of the host table, with the number
+/// of hosts in each tab.
+fn tabs_line(app: &App) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" │ ", Style::new().fg(app.palette.c400)));
+        }
+
+        let count = app
+            .all_hosts
+            .iter()
+            .filter(|host| tab.contains(&host.name))
+            .count();
+
+        let mut style = Style::new().fg(tab_color(*tab));
+        if *tab == app.tab {
+            style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+        }
+
+        spans.push(Span::styled(format!(" {} ({count}) ", tab.label()), style));
+    }
+
+    spans.push(Span::raw(" "));
+    Line::from(spans)
 }
 
 fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
@@ -591,6 +716,7 @@ mod tests {
             sort_by_name: false,
             sort_by_score: false,
             show_proxy_command: false,
+            initial_tab: Tab::All,
             command_template: r#"ssh "{{{name}}}""#.to_string(),
             command_template_on_session_start: None,
             command_template_on_session_end: None,
@@ -635,6 +761,116 @@ mod tests {
             app.table_columns_constraints[0],
             Constraint::Length(len) if len > 1
         ));
+    }
+
+    #[test]
+    fn test_hosts_are_grouped_under_client_headers() {
+        let mut config = test_config();
+        config.config_paths = vec![crate::test_support::testdata("groups.conf")
+            .to_string_lossy()
+            .into_owned()];
+        let mut app = App::new(&config).unwrap();
+
+        let names: Vec<_> = app.hosts.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["dev-web", "acme-web-b", "acme-web-g", "zeta-web-b"]
+        );
+
+        // Select acme-web-g: host index 2, rendered below the DEV and ACME headers.
+        app.next();
+        app.next();
+
+        let mut terminal = Terminal::new(backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        assert_eq!(app.display_state.selected(), Some(4));
+
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let row_of = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap();
+
+        assert!(row_of("DEV") < row_of("dev-web"));
+        assert!(row_of("dev-web") < row_of("ACME"));
+        assert!(row_of("ACME") < row_of("acme-web-b"));
+        assert!(row_of("acme-web-g") < row_of("ZETA"));
+
+        // Hosts are indented under their group header.
+        let column_of = |needle: &str| {
+            let line = &lines[row_of(needle)];
+            line[..line.find(needle).unwrap()].chars().count()
+        };
+        assert_eq!(
+            column_of("acme-web-b"),
+            column_of("ACME") + grouping::INDENT.len()
+        );
+        assert_eq!(
+            column_of("zeta-web-b"),
+            column_of("ZETA") + grouping::INDENT.len()
+        );
+        assert!(row_of("ZETA") < row_of("zeta-web-b"));
+
+        let acme_b = row_of("acme-web-b");
+        let acme_g = row_of("acme-web-g");
+        let byte = lines[acme_b].find("acme-web-b").unwrap();
+        let x = u16::try_from(lines[acme_b][..byte].chars().count()).unwrap();
+        let fg = |row: usize| buffer[(x, u16::try_from(row).unwrap())].fg;
+        assert_eq!(fg(acme_b), tailwind::BLUE.c400);
+        // The selected row is reversed, so its colour moves to the background.
+        assert!(buffer[(x, u16::try_from(acme_g).unwrap())]
+            .modifier
+            .contains(Modifier::REVERSED));
+        assert_eq!(fg(acme_g), tailwind::GREEN.c400);
+        let dev = row_of("dev-web");
+        assert_eq!(fg(dev), tailwind::ORANGE.c400);
+    }
+
+    #[test]
+    fn test_tabs_filter_hosts_and_keep_search() {
+        let mut config = test_config();
+        config.config_paths = vec![crate::test_support::testdata("groups.conf")
+            .to_string_lossy()
+            .into_owned()];
+        config.initial_tab = Tab::Dev;
+        let mut app = App::new(&config).unwrap();
+
+        let names = |app: &App| app.hosts.iter().map(|h| h.name.clone()).collect::<Vec<_>>();
+
+        assert_eq!(names(&app), vec!["dev-web"]);
+
+        app.show_tab(app.tab.next());
+        assert_eq!(app.tab, Tab::B);
+        assert_eq!(names(&app), vec!["acme-web-b", "zeta-web-b"]);
+
+        app.next();
+        app.show_tab(app.tab.next());
+        assert_eq!(app.tab, Tab::G);
+        assert_eq!(names(&app), vec!["acme-web-g"]);
+        assert_eq!(app.table_state.selected(), Some(0));
+
+        app.show_tab(app.tab.next());
+        assert_eq!(app.tab, Tab::All);
+        assert_eq!(app.hosts.len(), 4);
+
+        // The search input survives a tab switch.
+        for c in "acme".chars() {
+            type_char(&mut app, c);
+        }
+        assert_eq!(names(&app), vec!["acme-web-b", "acme-web-g"]);
+        app.show_tab(Tab::B);
+        assert_eq!(names(&app), vec!["acme-web-b"]);
+
+        let line = tabs_line(&app).to_string();
+        assert!(line.contains("dev (1)"), "{line}");
+        assert!(line.contains("-b (2)"), "{line}");
+        assert!(line.contains("-g (1)"), "{line}");
+        assert!(line.contains("all (4)"), "{line}");
     }
 
     /// Regression test for <https://github.com/quantumsheep/sshs/issues/120>:

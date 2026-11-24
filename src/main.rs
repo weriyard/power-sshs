@@ -1,3 +1,4 @@
+pub mod grouping;
 pub mod searchable;
 pub mod ssh;
 pub mod ssh_config;
@@ -75,6 +76,7 @@ fn main() -> Result<()> {
         color: args.color,
         sort_by_name: args.sort && !args.no_sort,
         sort_by_score: args.sort_fancy,
+        initial_tab: grouping::Tab::Dev,
         show_proxy_command: args.show_proxy_command,
         command_template: args.template,
         command_template_on_session_start: args.on_session_start_template,
