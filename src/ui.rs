@@ -211,7 +211,9 @@ impl App {
             if is_ctrl_pressed && key.code == Char('c') {
                 return Ok(AppKeyAction::Stop);
             }
-            self.on_popup_key(key.code);
+            if let Some(host) = self.on_popup_key(key.code) {
+                return self.connect_in_place(terminal, &host);
+            }
             return Ok(AppKeyAction::Ok);
         }
 
@@ -253,32 +255,16 @@ impl App {
                     return Ok(AppKeyAction::Ok);
                 }
 
-                let host: &ssh::Host = &self.hosts[selected];
+                let host = self.hosts[selected].clone();
 
-                if self.config.terminal_tabs && self.terminal != session::TerminalKind::Other {
-                    let host = host.clone();
-                    self.connect_or_choose_tab(&host);
+                if self.config.terminal_tabs
+                    && self.terminal != session::TerminalKind::Other
+                    && self.choose_tab(&host)
+                {
                     return Ok(AppKeyAction::Ok);
                 }
 
-                restore_terminal(terminal).expect("Failed to restore terminal");
-
-                if let Some(template) = &self.config.command_template_on_session_start {
-                    host.spawn_command_template(template)?;
-                }
-
-                host.spawn_command_template(&self.config.command_template)?;
-
-                if let Some(template) = &self.config.command_template_on_session_end {
-                    host.spawn_command_template(template)?;
-                }
-
-                setup_terminal(terminal).expect("Failed to setup terminal");
-                self.refresh_connections();
-
-                if self.config.exit_after_ssh_session_ends {
-                    return Ok(AppKeyAction::Stop);
-                }
+                return self.connect_in_place(terminal, &host);
             }
             _ => return Ok(AppKeyAction::Continue),
         }
@@ -370,11 +356,44 @@ impl App {
 
     /// Opens a new tab for a host without a connection, or shows the tab
     /// chooser for one that has some.
-    fn connect_or_choose_tab(&mut self, host: &ssh::Host) {
+    /// Runs the command template for `host` in this terminal and returns to
+    /// the list when it ends.
+    fn connect_in_place<B>(
+        &mut self,
+        terminal: &Rc<RefCell<Terminal<B>>>,
+        host: &ssh::Host,
+    ) -> Result<AppKeyAction>
+    where
+        B: Backend + std::io::Write,
+        <B as Backend>::Error: Send + Sync + 'static,
+    {
+        restore_terminal(terminal).expect("Failed to restore terminal");
+
+        if let Some(template) = &self.config.command_template_on_session_start {
+            host.spawn_command_template(template)?;
+        }
+
+        host.spawn_command_template(&self.config.command_template)?;
+
+        if let Some(template) = &self.config.command_template_on_session_end {
+            host.spawn_command_template(template)?;
+        }
+
+        setup_terminal(terminal).expect("Failed to setup terminal");
+        self.refresh_connections();
+
+        if self.config.exit_after_ssh_session_ends {
+            return Ok(AppKeyAction::Stop);
+        }
+        Ok(AppKeyAction::Ok)
+    }
+
+    /// Shows the tab chooser when `host` already has connections. Returns
+    /// whether it did; without connections the caller connects in place.
+    fn choose_tab(&mut self, host: &ssh::Host) -> bool {
         let ttys = session::ttys_for(&self.connections, &host.name, &host.destination);
         if ttys.is_empty() {
-            self.open_new_tab(host);
-            return;
+            return false;
         }
 
         let (tabs, error) = match session::tabs_for(self.terminal, &ttys, &host.name) {
@@ -387,55 +406,39 @@ impl App {
             tabs,
             error,
         });
+        true
     }
 
-    fn open_new_tab(&mut self, host: &ssh::Host) {
-        let result = host
-            .render_command_template(&self.config.command_template)
-            .and_then(|command| session::open_new_tab(self.terminal, &command));
-        if let Err(err) = result {
-            self.status = Some(format!("Could not open a tab: {err}"));
-        }
-    }
+    /// Handles a key while the tab chooser is open. Returns the host to
+    /// connect to in place, when a new connection was chosen.
+    fn on_popup_key(&mut self, code: KeyCode) -> Option<ssh::Host> {
+        let popup = self.popup.take()?;
 
-    fn on_popup_key(&mut self, code: KeyCode) {
-        let Some(popup) = self.popup.take() else {
-            return;
-        };
-        let jump_to = |tab: &session::Tab| session::jump(&tab.target);
-
-        let result = match code {
-            KeyCode::Esc => Ok(()),
-            KeyCode::Char('n') => {
-                self.open_new_tab(&popup.host);
-                Ok(())
-            }
-            KeyCode::Enter => {
-                if let Some(tab) = popup.tabs.first() {
-                    jump_to(tab)
-                } else {
-                    self.open_new_tab(&popup.host);
-                    Ok(())
-                }
-            }
+        let tab = match code {
+            KeyCode::Esc => return None,
+            KeyCode::Char('n') => return Some(popup.host),
+            KeyCode::Enter => match popup.tabs.first() {
+                Some(tab) => tab.clone(),
+                None => return Some(popup.host),
+            },
             KeyCode::Char(c @ '1'..='9') => {
-                let index = c as usize - '1' as usize;
-                if let Some(tab) = popup.tabs.get(index) {
-                    jump_to(tab)
+                if let Some(tab) = popup.tabs.get(c as usize - '1' as usize) {
+                    tab.clone()
                 } else {
                     self.popup = Some(popup);
-                    return;
+                    return None;
                 }
             }
             _ => {
                 self.popup = Some(popup);
-                return;
+                return None;
             }
         };
 
-        if let Err(err) = result {
+        if let Err(err) = session::jump(&tab.target) {
             self.status = Some(format!("Could not switch to the tab: {err}"));
         }
+        None
     }
 
     /// Switches to `tab`, keeping the search input, and selects its first host.
@@ -1202,13 +1205,14 @@ mod tests {
         assert!(screen.contains("[n]"), "{screen}");
 
         // A number without a tab and an unrelated key keep the popup open.
-        app.on_popup_key(KeyCode::Char('7'));
-        app.on_popup_key(KeyCode::Char('x'));
+        assert!(app.on_popup_key(KeyCode::Char('7')).is_none());
+        assert!(app.on_popup_key(KeyCode::Char('x')).is_none());
         assert!(app.popup.is_some());
 
-        app.on_popup_key(KeyCode::Esc);
+        // [n] asks for a new connection in place, to the popup's host.
+        let host = app.on_popup_key(KeyCode::Char('n')).map(|h| h.name);
+        assert_eq!(host.as_deref(), Some("acme-web-b"));
         assert!(app.popup.is_none());
-        assert!(app.status.is_none());
     }
 
     #[test]
@@ -1227,11 +1231,18 @@ mod tests {
         assert!(screen.contains("gdbus failed"), "{screen}");
         assert!(screen.contains("[Enter] new connection"), "{screen}");
 
-        // Enter opens a new tab; this terminal cannot, which is reported.
-        app.on_popup_key(KeyCode::Enter);
+        // Without a tab, Enter asks for a new connection in place.
+        let host = app.on_popup_key(KeyCode::Enter).map(|h| h.name);
+        assert_eq!(host.as_deref(), Some("dev-web"));
         assert!(app.popup.is_none());
-        let status = app.status.clone().unwrap();
-        assert!(status.contains("cannot open tabs"), "{status}");
+    }
+
+    #[test]
+    fn test_host_without_connection_gets_no_popup() {
+        let mut app = tabs_app();
+        let host = app.all_hosts[0].clone();
+        assert!(!app.choose_tab(&host));
+        assert!(app.popup.is_none());
     }
 
     #[test]
@@ -1241,7 +1252,7 @@ mod tests {
         let host = app.all_hosts[0].clone();
         assert_eq!(host.name, "dev-web");
 
-        app.connect_or_choose_tab(&host);
+        assert!(app.choose_tab(&host));
         let popup = app.popup.as_ref().unwrap();
         assert_eq!(popup.connections, 1);
         assert_eq!(popup.tabs, Vec::new());

@@ -67,8 +67,8 @@ struct Args {
     #[arg(short, long, default_value_t = false)]
     exit: bool,
 
-    /// Show live SSH connections per host and open or switch to terminal tabs
-    /// (`WezTerm`, GNOME Terminal)
+    /// Show live SSH connections per host and switch to the terminal tab that
+    /// holds one (`WezTerm`, GNOME Terminal)
     #[arg(long, default_value_t = false)]
     tabs: bool,
 }

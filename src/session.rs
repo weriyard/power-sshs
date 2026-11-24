@@ -16,7 +16,7 @@ use std::hash::BuildHasher;
 use std::process::Command;
 use std::sync::LazyLock;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 
@@ -25,8 +25,7 @@ use serde::Deserialize;
 pub enum TerminalKind {
     WezTerm,
     Gnome,
-    /// Any other terminal: connections are counted, tabs cannot be opened or
-    /// focused.
+    /// Any other terminal: connections are counted, tabs cannot be focused.
     Other,
 }
 
@@ -373,50 +372,6 @@ pub fn jump(target: &JumpTarget) -> Result<()> {
     Ok(())
 }
 
-/// The command that opens `argv` in a new tab of `kind`.
-#[must_use]
-pub fn new_tab_command(kind: TerminalKind, argv: &[String]) -> Option<Vec<String>> {
-    let prefix: &[&str] = match kind {
-        TerminalKind::WezTerm => &["wezterm", "cli", "spawn", "--"],
-        TerminalKind::Gnome => &["gnome-terminal", "--tab", "--"],
-        TerminalKind::Other => return None,
-    };
-    Some(
-        prefix
-            .iter()
-            .map(ToString::to_string)
-            .chain(argv.iter().cloned())
-            .collect(),
-    )
-}
-
-/// Opens `command` (a shell-like command line) in a new tab.
-///
-/// # Errors
-///
-/// Will return `Err` if the command cannot be parsed or the terminal cannot
-/// open a tab.
-pub fn open_new_tab(kind: TerminalKind, command: &str) -> Result<()> {
-    let argv =
-        shlex::split(command).ok_or_else(|| anyhow!("Failed to parse command: {command}"))?;
-    let full =
-        new_tab_command(kind, &argv).ok_or_else(|| anyhow!("This terminal cannot open tabs"))?;
-    let mut program = if full[0] == "wezterm" {
-        wezterm()
-    } else {
-        Command::new(&full[0])
-    };
-    let status = program
-        .args(&full[1..])
-        .stdout(std::process::Stdio::null())
-        .status()
-        .with_context(|| format!("Failed to run {}", full[0]))?;
-    if !status.success() {
-        bail!("{} failed with {status}", full[0]);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,19 +507,5 @@ mod tests {
     fn test_gvariant_strings_escapes_quotes() {
         assert_eq!(gvariant_strings(&["dev-web"]), "['dev-web']");
         assert_eq!(gvariant_strings(&["a'b"]), "['a\\'b']");
-    }
-
-    #[test]
-    fn test_new_tab_command() {
-        let argv = args("ssh dev-web");
-        assert_eq!(
-            new_tab_command(TerminalKind::WezTerm, &argv).unwrap(),
-            args("wezterm cli spawn -- ssh dev-web")
-        );
-        assert_eq!(
-            new_tab_command(TerminalKind::Gnome, &argv).unwrap(),
-            args("gnome-terminal --tab -- ssh dev-web")
-        );
-        assert_eq!(new_tab_command(TerminalKind::Other, &argv), None);
     }
 }
